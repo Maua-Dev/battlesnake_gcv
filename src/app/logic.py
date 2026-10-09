@@ -158,7 +158,22 @@ def get_move(state: GameState) -> MoveResponse:
     if sem_choque:
         candidatas = sem_choque
 
-    # 4. Objetivo: atacar (só com 2 cobras e sendo maior) ou comer
+    # 4. Kill fácil: se uma cobra menor pode entrar numa casa vizinha da nossa
+    #    cabeça, vamos para lá. Vale com qualquer número de cobras, desde que
+    #    nenhuma cobra igual ou maior também possa chegar nessa casa e que o
+    #    flood fill mostre espaço suficiente depois (não ficar presa).
+    kills = [
+        d for d in candidatas
+        if proxima(cabeca, d) in presas
+        and proxima(cabeca, d) not in perigosas
+        and espaco[d] >= meu_tamanho
+    ]
+    if kills:
+        escolha = max(kills, key=lambda d: espaco[d])
+        logger.info("MOVE %d: %s (kill)", state.turn, escolha)
+        return MoveResponse(move=escolha)
+
+    # 5. Objetivo: atacar (só com 2 cobras e sendo maior) ou comer
     modo_ataque = (
         len(state.board.snakes) == 2
         and len(adversarias) == 1
