@@ -5,15 +5,11 @@
 #  |    |   \ / __ \|  |  |  | |  |_\  ___/ \___ \|   |  \/ __ \|    <\  ___/
 #  |________/(______/__|  |__| |____/\_____>______>___|__(______/__|__\_____>
 #
-# ESTE É O ARQUIVO QUE VOCÊ VAI EDITAR. Todo o resto do projeto existe
-# só para levar o estado do jogo até as quatro funções abaixo.
-#
-# Para começar, já deixamos pronta a lógica que impede a sua cobra de andar
-# para trás (ela morreria na hora). Os TODOs marcam os próximos passos.
 # Documentação: https://docs.battlesnake.com
 
 import random
 import logging
+from collections import deque
 from .models import GameState, MoveResponse
 
 logger = logging.getLogger(__name__)
@@ -21,112 +17,180 @@ logger = logging.getLogger(__name__)
 # as jogadas nao aparecem no CloudWatch.
 logger.setLevel(logging.INFO)
 
+DIRECOES = {
+    "up": (0, 1),
+    "down": (0, -1),
+    "left": (-1, 0),
+    "right": (1, 0),
+}
+
+# Ajustes do modo de ataque (só vale com 2 cobras no tabuleiro)
+MARGEM_ATAQUE = 1   # quantos segmentos a mais precisamos ter para atacar
+FOME_MINIMA = 40    # abaixo dessa vida, comer vem antes de atacar
+
 
 def info() -> dict:
-    """GET / — chamado quando você cadastra a cobra e a cada partida.
-    Controla a aparência dela.
-    Opções de cabeça, cauda e cor: https://docs.battlesnake.com/guides/customizations
-    """
+    """GET / : chamado quando você cadastra a cobra e a cada partida."""
     logger.info("INFO")
-
     return {
         "apiversion": "1",
         "author": "",          # TODO: coloque aqui o SEU usuário do Battlesnake
-        "color": "#8B0000",    # TODO: escolha a cor da sua cobra
-        "head": "tiger-king",  # TODO: escolha a cabeça
-        "tail": "hook",        # TODO: escolha a cauda
-        "version": "1.0.0",
+        "color": "#8B0000",
+        "head": "tiger-king",
+        "tail": "hook",
+        "version": "1.1.0",
     }
 
 
 def start(state: GameState) -> None:
-    """POST /start — chamado uma vez, quando a partida começa.
-    Bom lugar para preparar qualquer estado inicial.
-    """
     logger.info("JOGO COMEÇOU (partida %s)", state.game.id)
 
 
 def end(state: GameState) -> None:
-    """POST /end — chamado uma vez, quando a partida termina."""
     logger.info("FIM DE JOGO após %d turnos", state.turn)
 
 
+# ---------------------------------------------------------------------------
+# Funções auxiliares
+# ---------------------------------------------------------------------------
+
+def proxima(pos, direcao):
+    dx, dy = DIRECOES[direcao]
+    return (pos[0] + dx, pos[1] + dy)
+
+
+def dentro(pos, largura, altura):
+    return 0 <= pos[0] < largura and 0 <= pos[1] < altura
+
+
+def celulas_ocupadas(state):
+    """Corpos de todas as cobras (inclusive a nossa).
+    A cauda sai do lugar no próximo turno, então fica livre,
+    a menos que a cobra tenha acabado de comer (cauda duplicada)."""
+    ocupadas = set()
+    for snake in state.board.snakes:
+        corpo = [(p.x, p.y) for p in snake.body]
+        if len(corpo) >= 3 and corpo[-1] != corpo[-2]:
+            corpo = corpo[:-1]
+        ocupadas.update(corpo)
+    return ocupadas
+
+
+def espaco_livre(inicio, ocupadas, largura, altura):
+    """Flood fill: quantas casas dá para alcançar a partir de 'inicio'.
+    Serve para não entrar em becos menores que a cobra."""
+    vistos = {inicio}
+    fila = deque([inicio])
+    while fila:
+        atual = fila.popleft()
+        for d in DIRECOES:
+            viz = proxima(atual, d)
+            if dentro(viz, largura, altura) and viz not in ocupadas and viz not in vistos:
+                vistos.add(viz)
+                fila.append(viz)
+    return len(vistos)
+
+
+def distancia_ate(inicio, alvos, ocupadas, largura, altura):
+    """BFS: menor número de passos até qualquer alvo, desviando dos corpos.
+    Devolve None se nenhum alvo for alcançável."""
+    if inicio in alvos:
+        return 0
+    vistos = {inicio}
+    fila = deque([(inicio, 0)])
+    while fila:
+        atual, dist = fila.popleft()
+        for d in DIRECOES:
+            viz = proxima(atual, d)
+            if viz in alvos:
+                return dist + 1
+            if dentro(viz, largura, altura) and viz not in ocupadas and viz not in vistos:
+                vistos.add(viz)
+                fila.append((viz, dist + 1))
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Jogada
+# ---------------------------------------------------------------------------
+
 def get_move(state: GameState) -> MoveResponse:
-    """POST /move — chamado a cada turno. Aqui mora a inteligência da sua cobra.
-    Precisa devolver "up", "down", "left" ou "right".
-    Exemplo do JSON recebido: https://docs.battlesnake.com/api/example-move
-    """
-    is_move_safe: dict[str, bool] = {
-        "up": True,
-        "down": True,
-        "left": True,
-        "right": True,
-    }
+    """POST /move : chamado a cada turno. Devolve "up", "down", "left" ou "right"."""
+    largura, altura = state.board.width, state.board.height
+    eu = state.you
+    cabeca = (eu.body[0].x, eu.body[0].y)
+    meu_tamanho = len(eu.body)
+    ocupadas = celulas_ocupadas(state)
+    adversarias = [s for s in state.board.snakes if s.id != eu.id]
 
-    # --- Impedir que a cobra ande para trás (já implementado) ---
-    # O pescoço é a parte do corpo logo atrás da cabeça. Voltar por cima dele
-    # é morte certa, então marcamos aquela direção como insegura.
-    my_head = state.you.body[0]
-    my_neck = state.you.body[1] if len(state.you.body) >= 2 else None
+    # Casas para onde as cabeças adversárias podem ir neste turno.
+    # Cabeça com cabeça: a menor morre, se empatar morrem as duas.
+    perigosas = set()  # cobra igual ou maior pode chegar aqui
+    presas = set()     # cobra menor pode chegar aqui
+    for snake in adversarias:
+        cab = (snake.body[0].x, snake.body[0].y)
+        for d in DIRECOES:
+            casa = proxima(cab, d)
+            if len(snake.body) >= meu_tamanho:
+                perigosas.add(casa)
+            else:
+                presas.add(casa)
 
-    if my_neck is not None:
-        if my_neck.x < my_head.x:
-            # pescoço à esquerda da cabeça -> não vá para a esquerda
-            is_move_safe["left"] = False
-        elif my_neck.x > my_head.x:
-            # pescoço à direita da cabeça -> não vá para a direita
-            is_move_safe["right"] = False
-        elif my_neck.y < my_head.y:
-            # pescoço abaixo da cabeça -> não desça
-            is_move_safe["down"] = False
-        elif my_neck.y > my_head.y:
-            # pescoço acima da cabeça -> não suba
-            is_move_safe["up"] = False
+    # 1. Jogadas que não matam na hora: parede, nosso corpo e corpo das outras
+    seguras = [
+        d for d in DIRECOES
+        if dentro(proxima(cabeca, d), largura, altura)
+        and proxima(cabeca, d) not in ocupadas
+    ]
 
-    # 2. Impedir que a cobra saia do tabuleiro (paredes)
-    board_width = state.board.width
-    board_height = state.board.height
-
-    if my_head.x + 1 >= board_width:
-        is_move_safe["right"] = False
-    if my_head.x - 1 < 0:
-        is_move_safe["left"] = False
-    if my_head.y + 1 >= board_height:
-        is_move_safe["up"] = False
-    if my_head.y - 1 < 0:
-        is_move_safe["down"] = False
-
-    # 3. Impedir que a cobra bata no próprio corpo
-    my_body = state.you.body
-    for segment in my_body:
-        if segment.x == my_head.x + 1 and segment.y == my_head.y:
-            is_move_safe["right"] = False
-        if segment.x == my_head.x - 1 and segment.y == my_head.y:
-            is_move_safe["left"] = False
-        if segment.x == my_head.x and segment.y == my_head.y + 1:
-            is_move_safe["up"] = False
-        if segment.x == my_head.x and segment.y == my_head.y - 1:
-            is_move_safe["down"] = False
-
-    # TODO: Passo 3 — impedir que a cobra bata nas adversárias
-    # opponents = state.board.snakes
-
-    # Sobrou alguma direção segura?
-    safe_moves = [direction for direction, safe in is_move_safe.items() if safe]
-
-    if not safe_moves:
-        # Emergência: todas as direções são perigosas.
-        # Escolhemos uma ao acaso entre as 4 — melhor do que travar.
-        all_moves = ["up", "down", "left", "right"]
-        fallback = random.choice(all_moves)
+    if not seguras:
+        fallback = random.choice(list(DIRECOES))
         logger.info("MOVE %d: sem saída! emergência -> %s", state.turn, fallback)
         return MoveResponse(move=fallback)
 
-    # Escolhe uma direção segura ao acaso.
-    chosen = random.choice(safe_moves)
+    # 2. Não entrar em espaço menor que o nosso tamanho (evita se trancar)
+    espaco = {d: espaco_livre(proxima(cabeca, d), ocupadas, largura, altura) for d in seguras}
+    com_folga = [d for d in seguras if espaco[d] >= meu_tamanho]
+    candidatas = com_folga or [max(seguras, key=lambda d: espaco[d])]
 
-    # TODO: Passo 4 — ir atrás da comida em vez de sortear, para não morrer de fome
-    # food = state.board.food
+    # 3. Evitar cabeça com cabeça contra cobra igual ou maior, se der
+    sem_choque = [d for d in candidatas if proxima(cabeca, d) not in perigosas]
+    if sem_choque:
+        candidatas = sem_choque
 
-    logger.debug("MOVE %d: %s", state.turn, chosen)
-    return MoveResponse(move=chosen)
+    # 4. Objetivo: atacar (só com 2 cobras e sendo maior) ou comer
+    modo_ataque = (
+        len(state.board.snakes) == 2
+        and len(adversarias) == 1
+        and meu_tamanho >= len(adversarias[0].body) + MARGEM_ATAQUE
+        and eu.health > FOME_MINIMA
+    )
+
+    if modo_ataque:
+        # Ir para as casas onde a cabeça da adversária pode entrar
+        alvos = {c for c in presas if dentro(c, largura, altura) and c not in ocupadas}
+        modo = "ataque"
+    else:
+        alvos = {(f.x, f.y) for f in state.board.food}
+        modo = "comida"
+
+    escolha = None
+    if alvos:
+        distancias = {}
+        for d in candidatas:
+            dist = distancia_ate(proxima(cabeca, d), alvos, ocupadas, largura, altura)
+            if dist is not None:
+                distancias[d] = dist
+        if distancias:
+            menor = min(distancias.values())
+            empatadas = [d for d, dist in distancias.items() if dist == menor]
+            # No empate, fica com a que deixa mais espaço livre
+            escolha = max(empatadas, key=lambda d: espaco[d])
+
+    # Sem alvo alcançável: vai para onde tem mais espaço
+    if escolha is None:
+        escolha = max(candidatas, key=lambda d: espaco[d])
+        modo = "espaço"
+
+    logger.info("MOVE %d: %s (%s)", state.turn, escolha, modo)
+    return MoveResponse(move=escolha)
